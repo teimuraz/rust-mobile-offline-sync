@@ -1,5 +1,7 @@
 # rust-mobile-offline-sync
 
+![Offline-first sync with event sourcing — one Rust core, every platform](docs/cover.png)
+
 **Offline-first sync with a Rust core shared across iOS, Android, and the backend — via event sourcing.**
 
 A small, honest demo of the architecture behind [TrainVision](https://trainvision.ai):

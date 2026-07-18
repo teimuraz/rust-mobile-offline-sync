@@ -1,4 +1,9 @@
-# Offline-first sync with event sourcing, shared between my Rust backend and mobile app
+<!--
+Title (put this in the platform's TITLE field — dev.to / Medium / Hashnode render
+it as the page H1, so it must NOT also appear as a `#` heading in the body):
+
+I built an offline-first sync engine with event sourcing, in Rust shared between mobile and backend
+-->
 
 *A small, honest write-up of a thing I built mostly for fun, that somehow ended up working. Code: [github.com/teimuraz/rust-mobile-offline-sync](https://github.com/teimuraz/rust-mobile-offline-sync)*
 
@@ -136,28 +141,27 @@ The device and the server implement the *same* `EventLog` trait. On the backend 
 
 ## Does it actually work? Here's it running
 
-The repo ships a runnable simulation — a server and two phones, each with its own event log — that takes the phones offline, lets them capture and edit, then syncs. `cargo run -p backend`:
+The repo ships the real thing, end to end: an axum backend with its own event log, and a SwiftUI app driving the shared Rust SDK — local edits, background sync job, and an **Online toggle** that simulates losing the network.
 
-```text
-== 1. Both phones OFFLINE, capturing independently ==
-  phone_a: Wrench qty=8 note=left bin
-  phone_b: Bolt   qty=5
-
-== 2. Connectivity returns — each phone syncs with the server ==
-  phone_a: Wrench qty=8 · Bolt qty=5
-  phone_b: Wrench qty=8 · Bolt qty=5      -> both phones now see both items
-
-== 3. Concurrent edit to the SAME item while offline ==
-  phone_a set qty=7 @2001, phone_b set qty=9 @2051 (both offline)
-  -> converged on qty=9 (later device clock wins, deterministically)
-
-== 4. Delete wins over a concurrent edit ==
-  -> Bolt is deleted everywhere; the post-delete edit was dropped
-
-All replicas converged. ✔
+```sh
+cargo run -p backend --bin server   # the backend (in-memory; Postgres in reality)
+./mobile/ios/build_rust.sh          # compile the Rust SDK for iOS + Swift bindings
 ```
 
-Every convergence step is an `assert_eq!` in the code, plus unit tests for the fold, two-replica convergence, and deletion-wins.
+Then run the app in **two simulators side by side** — each install gets its own replica id, so they're two independent devices syncing through the real server over HTTP:
+
+- Add items on device A → they show up on device B a few seconds later.
+- Toggle device B offline, edit the *same* item on both, bring B back online → both devices converge (later device clock wins), and flipping back online triggers an immediate sync.
+- Delete an item on A while B edits it offline → the deletion wins everywhere.
+
+And you can watch it from the server's side while you do it:
+
+```sh
+curl localhost:4000/items       # current state, folded server-side from the events
+curl localhost:4000/events/all  # the raw event log with all the provenance
+```
+
+The fold, two-replica convergence, and deletion-wins are also pinned down as unit tests (`cargo test -p shared`).
 
 ## It's simple — and it works
 
@@ -171,4 +175,6 @@ It's deliberately small. The point isn't the app; it's the shape: one Rust event
 
 This is the engine behind [TrainVision](https://trainvision.ai) — if you're collecting training data in the field and want it to just work offline, that's what it's for.
 
-*Built with Rust + UniFFI. Questions and roasts welcome — [contact / link].*
+*Built with Rust + UniFFI. Questions and roasts welcome — in the comments or on [GitHub](https://github.com/teimuraz/rust-mobile-offline-sync/issues).*
+
+*— Teimuraz, building [TrainVision](https://trainvision.ai)*
