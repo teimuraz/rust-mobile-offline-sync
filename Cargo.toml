@@ -5,7 +5,7 @@ members = ["shared", "client-sdk", "backend"]
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/YOUR_USERNAME/rust-mobile-offline-sync"
+repository = "https://github.com/teimuraz/rust-mobile-offline-sync"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

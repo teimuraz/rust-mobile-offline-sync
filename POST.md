@@ -1,6 +1,6 @@
 # Offline-first sync with event sourcing, shared between my Rust backend and mobile app
 
-*A small, honest write-up of a thing I built mostly for fun, that somehow ended up working. Code: [github.com/YOUR_USERNAME/rust-mobile-offline-sync](https://github.com/YOUR_USERNAME/rust-mobile-offline-sync)*
+*A small, honest write-up of a thing I built mostly for fun, that somehow ended up working. Code: [github.com/teimuraz/rust-mobile-offline-sync](https://github.com/teimuraz/rust-mobile-offline-sync)*
 
 First, the setup — because it explains all the Rust in this post. The app I built this for is [TrainVision](https://trainvision.ai), a mobile-first platform for collecting machine-learning training data out in the real world (where reliable connectivity is often exactly what you don't have). Its **core is written in Rust and shared across iOS and Android** via [UniFFI](https://mozilla.github.io/uniffi-rs/): the models, the sync, the business rules are written *once* in Rust and compiled into a native library both phones call through generated Swift and Kotlin bindings. The **backend is Rust too**, so the same code runs there. Storage is **SQLite on the device** and **Postgres on the backend**. That shared-Rust core is half of what this post is about; event sourcing is the other half — and the two turn out to fit together beautifully for offline sync.
 
@@ -165,7 +165,7 @@ I'll be clear-eyed: this is a small, deliberately simple design, not a big frame
 
 If it's useful to anyone, I pulled the core idea into a tiny, generic demo — an offline-first inventory of `Item`s — with the shared Rust crate, the sync engine, and the runnable simulation above:
 
-**→ [github.com/YOUR_USERNAME/rust-mobile-offline-sync](https://github.com/YOUR_USERNAME/rust-mobile-offline-sync)**
+**→ [github.com/teimuraz/rust-mobile-offline-sync](https://github.com/teimuraz/rust-mobile-offline-sync)**
 
 It's deliberately small. The point isn't the app; it's the shape: one Rust event model, folded on the server and on the phone, synced by a plain offset cursor. If you're staring down offline-first and the existing tools feel like too much, maybe event sourcing is your cheat code too.
 
