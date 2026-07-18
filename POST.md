@@ -109,15 +109,18 @@ Here's where I stop pretending it's perfect. To fold events deterministically yo
 When I poked at how some established apps handle this — Apple Notes, for one — they seem to lean on device local time in much the same way. That made me feel a lot better about not over-thinking it.
 
 ```rust
-pub struct ModificationInfo {
-    pub replica_id: String,     // which device/server produced it
-    pub replica_time_ms: i64,   // that replica's wall-clock at creation
-    pub write_offset: u64,      // per-replica tie-breaker
+pub struct EventDescriptor<E, EntId> {
+    pub replica_event_id: Uuid,    // unique across all replicas
+    pub replica_id: String,        // which device/server authored it
+    pub replica_time_ms: i64,      // that replica's wall-clock at creation
+    pub replica_write_offset: u64, // per-replica tie-breaker
+    pub payload: E,                // the domain event itself
+    // ... entity id, server-assigned offset/time
 }
 
 // the canonical fold order, applied on every replica before folding:
 fn order_key(d: &EventDescriptor) -> (i64, u64, Uuid) {
-    (d.replica_time_ms, d.write_offset, d.event_id)
+    (d.replica_time_ms, d.replica_write_offset, d.replica_event_id)
 }
 ```
 

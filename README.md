@@ -2,199 +2,176 @@
 
 ![Offline-first sync with event sourcing — one Rust core, every platform](docs/cover.png)
 
-**Offline-first sync with a Rust core shared across iOS, Android, and the backend — via event sourcing.**
+*A small, honest write-up of a thing I built mostly for fun, that somehow ended up working. Code: [github.com/teimuraz/rust-mobile-offline-sync](https://github.com/teimuraz/rust-mobile-offline-sync)*
 
-A small, honest demo of the architecture behind [TrainVision](https://trainvision.ai):
-you capture data on a phone with no connection, and it reconciles cleanly with the
-server (and other devices) once a connection returns. The domain model, the fold,
-the ordering rules, and the sync engine are written **once in Rust**; the mobile
-app gets them through UniFFI, the backend uses them directly.
+First, the setup — because it explains all the Rust in this post. The app I built this for is [TrainVision](https://trainvision.ai), a mobile-first platform for collecting machine-learning training data out in the real world (where reliable connectivity is often exactly what you don't have). Its **core is written in Rust and shared across iOS and Android** via [UniFFI](https://mozilla.github.io/uniffi-rs/): the models, the sync, the business rules are written *once* in Rust and compiled into a native library both phones call through generated Swift and Kotlin bindings. The **backend is Rust too**, so the same code runs there. Storage is **SQLite on the device** and **Postgres on the backend**. That shared-Rust core is half of what this post is about, event sourcing is the other half — and the two turn out to fit together beautifully for offline sync.
 
-> This is a stripped-down reference, not a library. The domain here is a boring
-> inventory `Item`; the point is the *shape*, not the app.
->
-> 📄 The write-up that explains the "why" is in [`POST.md`](./POST.md).
+Now the actual problem. I needed an app that works with no internet. Not "degrades gracefully" — genuinely works: you're in a field, a factory, a basement, you capture data all day, and it syncs whenever a connection comes back. Sometimes there's good signal, often it's weak, sometimes there's none at all — the point of offline-*first* is that the app never assumes the network is there. Connectivity is a nice bonus when it shows up, not something the app leans on.
 
-## The idea in one sentence
+I looked for something existing first — Couchbase (Lite + Sync Gateway), ObjectBox, a few others. I got furthest with Couchbase, but couldn't get it to click. The moment I wanted to control how conflicts resolved or shape sync around my own domain, I felt like I was fighting the framework instead of using it.
 
-**Don't store the item — store the events that produced it.** Current state is a
-fold over an append-only event log, which makes offline capture and multi-device
-sync fall out naturally.
+I don't recommend "just build your own sync engine" as career advice. But I was curious, it looked fun, and I wanted full control. So I started sketching how I'd do it myself — and it hit me: **event sourcing.**
 
-## Architecture
+It wasn't a bolt from the blue. I'd played with event sourcing before, in a completely different context — a classic event-sourced *backend* architecture, nothing to do with offline or mobile. I'd found it a genuinely interesting way to build a system: state as a fold over an append-only log of domain events. So when I started thinking about how two offline devices could ever reconcile, that old idea walked right back in the door wearing a new hat.
 
-```
-┌─────────────────────────────┐      ┌─────────────────────────────┐
-│  iOS (SwiftUI)              │      │  Android (Kotlin)           │
-│  thin UI, no logic          │      │  (same bindings)            │
-└──────────────┬──────────────┘      └──────────────┬──────────────┘
-               │ UniFFI (async)                      │
-               ▼                                     ▼
-┌───────────────────────────────────────────────────────────────────┐
-│  client-sdk (Rust, compiled into the app)                         │
-│   ffi.rs          ItemService + EventSourcedStores (uniffi)       │
-│   item_service.rs local ops only — knows nothing about network    │
-│   event_log.rs    DeviceEventLog: append_local / append /         │
-│                   get_unsynced / mark_synced   (SQLite in reality)│
-│   sync.rs         push unsynced → ack → pull after cursor         │
-│   sync_runner.rs  background job (every N s) or sync_now,         │
-│                   SyncListener callback → UI refresh              │
-│   http.rs         HTTP client to the backend                      │
-└──────────────────────────────┬────────────────────────────────────┘
-              HTTP (JSON)      │ POST /events · GET /events?after=
-                               ▼
-┌───────────────────────────────────────────────────────────────────┐
-│  backend (Rust, axum)                                             │
-│   event_log.rs  ServerEventLog: assigns server_offset             │
-│                 (Postgres/MySQL in reality)                       │
-│   server.rs     POST /events · GET /events · GET /items           │
-└──────────────────────────────┬────────────────────────────────────┘
-                               │ both depend on
-                               ▼
-┌───────────────────────────────────────────────────────────────────┐
-│  shared (Rust)                                                    │
-│   core.rs         EventSourcedEntity, EventDescriptor, ordering   │
-│   item.rs         the demo domain (Item + ItemEvent)              │
-│   item_storage.rs projection storage: store → log + rebuild row;  │
-│                   reads → projection table only                   │
-│   event_log.rs    wire types + the EntityEventLog contract        │
-└───────────────────────────────────────────────────────────────────┘
+## Why event sourcing makes offline sync easy
+
+The hard part of offline-first isn't storing data locally. It's *merging*. Two devices edit the same thing while both are offline, someone deletes a record another person just updated, the same change syncs twice on a flaky connection. If each device only keeps the **current state**, merging means shipping whole entities back and forth, comparing them field by field, and guessing what changed — and every one of those guesses is a chance to get it wrong. I wanted something stupidly simple instead.
+
+Event sourcing flips it. You don't store the item. You store the **events** that produced it:
+
+```json
+ItemCreated      { name: "Wrench", quantity: 10 }
+QuantityChanged  { quantity: 8 }
+NoteChanged      { note: "left bin" }
 ```
 
-Each side has its **own event log implementation** (like the real app: SQLite on
-device, Postgres on the backend); the projection storage and domain are shared
-code. Everything here is in-memory so the demo runs with no database.
+The current item is just a *fold* over those events — replay them in order and you get the current state. (That folded result has a name in event-sourcing circles: a **projection**.) That one shift changes everything for sync, because events are:
 
-## How sync works
+- **Append-only** — devices never overwrite each other, they only add. Sync becomes "ship the events the other side hasn't seen yet."
+- **Idempotent to replay** — every event has an id, so receiving it twice is a no-op. A dropped connection mid-sync costs nothing but a retry.
+- **Orderable** — put every replica's events into one agreed order and they all fold to the same state.
 
-Every event carries provenance:
+My entire entity contract is one small trait:
 
-- `replica_id`, `replica_time_ms`, `replica_write_offset` — who authored it, when,
-  with a per-replica tie-breaker (assigned by the local log on `append_local`).
-- `server_offset: Option<...>` — position in the server's stream, assigned by the
-  server when the event reaches it. **On a device, `None` means "not synced yet."**
+```rust
+pub trait EventSourcedEntity: Default {
+    type Evt: Event;
+    type EntId: EntityId;
 
-A sync round is then:
+    /// The only thing a domain type must define: given the current state and one
+    /// event, produce the next state.
+    fn apply_event(&mut self, event: Self::Evt, modification_info: ModificationInfo);
 
-1. **Push** — send local events where `server_offset IS NULL`; the server stores
-   them (idempotently), assigns `server_offset`, and returns them; the device
-   records the acknowledgement (`mark_synced`). No push cursor needed — the
-   unsynced marker lives on the events themselves, and a retried push after a lost
-   ack simply gets the same acknowledgement back.
-2. **Pull** — ask for everything after the highest `server_offset` seen, append it
-   to the local log (idempotent), rebuild the projections of touched entities.
+    fn uncommitted_events(&mut self) -> &mut Vec<EntityEvent<Self::Evt>>;
+    fn id(&self) -> &Self::EntId;
 
-Conflict resolution: every replica folds events in the same total order —
-`replica_time → replica_write_offset → replica_event_id` — so all replicas
-converge. **Deletion wins** over concurrent edits (a single `if deleted { return }`
-in the fold).
+    /// Rebuild by folding history (already in canonical order).
+    fn build_from_history(events: Vec<EventDescriptor<Self::Evt, Self::EntId>>) -> Self {
+        let mut entity = Self::default();
+        for event in events {
+            let info = event.modification_info();
+            entity.apply_event(event.payload, info);
+        }
+        entity
+    }
 
-The server folds pushed events into **its own projections** with the same shared
-storage code — that's what `GET /items` serves.
+    /// Record a new local change: remember it as uncommitted, and apply it now so
+    /// the UI updates immediately — even fully offline.
+    fn new_event(&mut self, event: EntityEvent<Self::Evt>) {
+        self.uncommitted_events().push(event.clone());
+        self.apply_event(event.event, event.modification_info);
+    }
+}
+```
 
-## Run it
+A domain type implements `apply_event` **once** — "given current me and this event, here's the new me" — and gets local optimistic updates, history rebuild, and sync for free. In the demo repo that domain type is a deliberately boring inventory `Item`, and its `apply_event` is the whole thing:
+
+```rust
+fn apply_event(&mut self, event: ItemEvent, info: ModificationInfo) {
+    if self.deleted {
+        return; // deletion is terminal — this line is the entire "delete wins" rule
+    }
+    self.last_modified_ms = info.replica_time_ms;
+    match event {
+        ItemEvent::Created { name, quantity } => { self.name = name; self.quantity = quantity; }
+        ItemEvent::Renamed { name }           => self.name = name,
+        ItemEvent::QuantityChanged { quantity } => self.quantity = quantity,
+        ItemEvent::NoteChanged { note }       => self.note = note,
+        ItemEvent::Deleted                    => self.deleted = true,
+    }
+}
+```
+
+## "Why not just sync the database change log?"
+
+Fair question — the obvious alternative is row-level change-data-capture: ship the database's change log (WAL / logical replication / a `changes` table) and replay it on the other side. Plenty of sync systems work exactly this way.
+
+Honestly, I don't have a rigorous answer for why I didn't. It came down to this: **I didn't want to sync rows, I wanted to sync intent.** A row change tells you `quantity: 10 → 8`. A domain event tells you *`QuantityChanged { 8 }`* — the actual thing that happened, with the meaning attached. That difference ended up mattering for two things I cared about: resolving conflicts (a `Deleted` event can *mean* "this beats a concurrent edit", where two raw row-writes just look like a clash), and — the bigger one — **authorization**.
+
+## Authorization: who can push and pull what
+
+This turned out to be a big one for me. In my app, a user is **not** allowed to sync everything. They can read and write only a slice of the data: some **common/shared data** everyone in their scope sees, plus **their own data** — and nothing else. So when a device pushes a batch of events, the server has to check, for each event: *is this user allowed to write this?* And when it pulls: *which data is this user even allowed to see?*
+
+Domain events gave me a natural place to enforce that. Every event knows which entity it targets and who authored it, so the server can authorize each pushed event against the user's permitted scope, and filter the pull side down to exactly the slices they're allowed to read. Maybe you can do this just as well with a row-log approach — I genuinely didn't dig into it. This just felt like a clean seam to me, so I went with it.
+
+*(The demo repo keeps this part deliberately simple — the point there is the sync mechanics — but scoped, per-event authorization is a first-class concern in the real app, not an afterthought.)*
+
+## The honest part: ordering across devices
+
+Here's where I stop pretending it's perfect. To fold events deterministically you need a **total order across devices**, and there is no global clock. My rule:
+
+> Order by the event's **replica (device) time** first. Device clocks drift, and can even be set wrong on purpose — *this is a fact we accept.* If two events land on the exact same timestamp, a per-device counter breaks the tie; if even that matches, the event id does.
+
+When I poked at how some established apps handle this — Apple Notes, for one — they seem to lean on device local time in much the same way. That made me feel a lot better about not over-thinking it.
+
+```rust
+pub struct ModificationInfo {
+    pub replica_id: String,     // which device/server produced it
+    pub replica_time_ms: i64,   // that replica's wall-clock at creation
+    pub write_offset: u64,      // per-replica tie-breaker
+}
+
+// the canonical fold order, applied on every replica before folding:
+fn order_key(d: &EventDescriptor) -> (i64, u64, Uuid) {
+    (d.replica_time_ms, d.write_offset, d.event_id)
+}
+```
+
+So the whole rule is: **the most recent change by the device clock wins**, and everything gets applied in that order. It's not a clever academic algorithm — I deliberately kept it dead simple, predictable, and easy to reason about. The one extra rule I add: **deletion wins over concurrent edits** — and as you saw above, that's not special machinery, it's a single `if self.deleted { return; }`.
+
+Sync itself is then almost boring, which is the goal. The server stamps each event with a monotonic `ServerOffset`. A device remembers the highest offset it has pulled and asks: *"give me everything after this."* It folds the new events into its projections, ships its own un-synced events up, done. In the real app that ask-and-ship is a gRPC round-trip to the backend; in the demo repo it's just an in-process function call — same logic, different transport. No diffing, no merge UI, no magic:
+
+```rust
+pub trait EventLog<E, EntId> {
+    fn append(&mut self, events: Vec<AppendEvent<E, EntId>>) -> Vec<EventDescriptor<E, EntId>>;
+    fn events_of_entity(&self, entity_id: &EntId) -> Vec<EventDescriptor<E, EntId>>;
+    fn events_after(&self, offset: Option<ServerOffset>, limit: usize) -> EventsPage<E, EntId>;
+}
+```
+
+## The part I'm actually proud of: one codebase, three platforms
+
+I write Rust for the backend. The mobile app is iOS (Swift) and Android (Kotlin). And it isn't just the sync plumbing that's shared — the **domain models and their events are shared too.** The `Item` entity, the `ItemEvent` enum that spells out every change that can happen to it, the fold that turns those events into current state, the ordering, the codecs both sides must agree on byte-for-byte — all of it is the **exact same Rust code** running in all three places. I define an entity and its events *once*, and the backend and both phones already agree, down to the byte, on what they are.
+
+The device and the server implement the *same* `EventLog` trait. On the backend it's backed by **Postgres**; on the phone by **SQLite**. Same interface, same folding logic, same conflict rules — because it is *literally the same functions* on top of two different storage backends. On mobile the crate is compiled to a native library and exposed to Swift/Kotlin through UniFFI, so iOS and Android share it too.
+
+## Does it actually work? Here's it running
+
+The repo ships the real thing, end to end: an axum backend with its own event log, and a SwiftUI app driving the shared Rust SDK — local edits, background sync job, and an **Online toggle** that simulates losing the network.
 
 ```sh
-# The backend (in-memory storage; Postgres in reality):
-cargo run -p backend --bin server
-cargo test -p shared    # fold, two-replica convergence, deletion-wins
+cargo run -p backend --bin server   # the backend (in-memory; Postgres in reality)
+./mobile/ios/build_rust.sh          # compile the Rust SDK for iOS + Swift bindings
 ```
 
-### Backend endpoints (poke at the demo)
+Then run the app in **two simulators side by side** — each install gets its own replica id, so they're two independent devices syncing through the real server over HTTP:
 
-| Endpoint | What you see |
-|---|---|
-| `GET /items` | Current items as the **server** sees them — projections folded server-side from the events the phones pushed |
-| `GET /events/all` | The **full item event log** with all provenance (`replica_id`, `replica_time_ms`, `replica_write_offset`, `server_offset`, …) — the append-only source of truth |
-| `GET /events?after=&limit=` | The sync **pull** stream: events after a `server_offset` cursor |
-| `POST /events` | The sync **push**: append a batch; responds with the stored events incl. assigned `server_offset` (the device's ack) |
-| `GET /health` | Liveness |
+- Add items on device A → they show up on device B a few seconds later.
+- Toggle device B offline, edit the *same* item on both, bring B back online → both devices converge (later device clock wins), and flipping back online triggers an immediate sync.
+- Delete an item on A while B edits it offline → the deletion wins everywhere.
+
+And you can watch it from the server's side while you do it:
 
 ```sh
-curl localhost:4000/items | jq            # what state does the server have?
-curl localhost:4000/events/all | jq       # …and exactly which events produced it
+curl localhost:4000/items       # current state, folded server-side from the events
+curl localhost:4000/events/all  # the raw event log with all the provenance
 ```
 
-## Build & run the iOS app
+The fold, two-replica convergence, and deletion-wins are also pinned down as unit tests (`cargo test -p shared`).
 
-Requires Xcode, the Rust iOS targets (installed automatically by the pinned
-toolchain), and [XcodeGen](https://github.com/yonatanp/XcodeGen)
-(`brew install xcodegen`).
+## It's simple — and it works
 
-```sh
-# 1. Compile the client-sdk for iOS → .xcframework + Swift bindings
-./mobile/ios/build_rust.sh
+I'll be clear-eyed: this is a small, deliberately simple design, not a big framework, and there are edge cases I've chosen to accept rather than solve. But the clock-based ordering has held up fine in practice — and, as I mentioned, it seems to be roughly how apps like Apple Notes handle it too. It survives real offline use, and I understand every line — which, after fighting a black-box sync framework, is worth a lot.
 
-# 2. Generate the Xcode project and open it
-cd mobile/ios
-xcodegen generate
-open OfflineSyncDemo.xcodeproj
+If it's useful to anyone, I pulled the core idea into a tiny, generic demo — an offline-first inventory of `Item`s — with the shared Rust crate, the sync engine, and the runnable simulation above:
 
-# 3. Have the backend running (the app syncs to http://127.0.0.1:4000)
-cargo run -p backend --bin server
-```
+**→ [github.com/teimuraz/rust-mobile-offline-sync](https://github.com/teimuraz/rust-mobile-offline-sync)**
 
-Run on an **Apple-Silicon simulator or a device** (the packaged `.xcframework`
-ships arm64 device + arm64 simulator slices).
+It's deliberately small. The point isn't the app; it's the shape: one Rust event model, folded on the server and on the phone, synced by a plain offset cursor. If you're staring down offline-first and the existing tools feel like too much, maybe event sourcing is your cheat code too.
 
-<p align="center">
-  <img src="docs/app-screenshot.png" alt="The demo app: one device with its replica id, Online and Background-sync toggles, and the item list" width="360">
-</p>
+This is the engine behind [TrainVision](https://trainvision.ai) — if you're collecting training data in the field and want it to just work offline, that's what it's for.
 
-The app is **one device** — a single `ItemService` + `SyncRunner`, with a replica
-id generated on first launch. Two toggles drive the demo:
+*Built with Rust + UniFFI. Questions and roasts welcome — in the comments or on [GitHub](https://github.com/teimuraz/rust-mobile-offline-sync/issues).*
 
-- **Online** — simulated connectivity, tracked by the Rust runner (a stand-in for
-  a real reachability watcher). Flip it off, add and edit items — everything works
-  and piles up locally with `server_offset = NULL`. Flip it back on and the runner
-  **syncs immediately** (sync-on-reconnect); check `curl localhost:4000/items`.
-- **Background sync (every 5s)** — the interval job, **on by default**. Ticks are
-  skipped while offline.
-
-### See sync in action: run two simulators
-
-Each install gets its own replica id, so two simulators are two independent
-devices converging through the real server:
-
-```sh
-cargo run -p backend --bin server        # keep the backend running
-```
-
-In Xcode, run the app on one simulator (e.g. iPhone 16), then change the run
-destination to a **different** simulator model and run again — both stay open.
-Place the two simulator windows side by side (background sync is already on), and:
-
-1. Add items on device A → they appear on device B within ~5s.
-2. Toggle device B **offline**, edit the same item on both devices, then bring B
-   back online → both converge (later device clock wins).
-3. Delete an item on A while B edits it offline → the deletion wins everywhere.
-
-## What the demo intentionally leaves out
-
-- **Persistence.** Everything is in-memory: the logs, the projection tables, the
-  sync cursor. In the real app they're SQLite on the device and Postgres on the
-  backend, behind the same contracts — swapping them in doesn't change the sync
-  logic.
-- **gRPC.** The demo syncs over plain HTTP/JSON; the real app uses gRPC. Same two
-  calls (`push`, `pull`), different wire.
-- **Connectivity detection.** The runner syncs on an interval or on demand; a real
-  app also watches reachability and syncs when a connection returns.
-- **Authorization.** The real event carries `space_id` / `owner_user_id` /
-  `created_by`, and the server checks per event who may push/pull what. The demo
-  omits those fields entirely.
-- **Projection versioning.** The real storage guards concurrent projection
-  rebuilds with optimistic versioning; unnecessary here.
-
-## Layout
-
-| Path | What |
-|------|------|
-| `shared/` | Domain + event-sourcing core, projection storage, wire types |
-| `client-sdk/` | The mobile SDK: device log, sync engine + runner, HTTP client, UniFFI surface |
-| `backend/` | axum server: server log, `POST/GET /events`, `GET /items` |
-| `mobile/ios/` | SwiftUI app + `build_rust.sh` + XcodeGen spec |
-| `POST.md` | The blog write-up |
-
-## License
-
-MIT
+*— Teimuraz, building [TrainVision](https://trainvision.ai)*
