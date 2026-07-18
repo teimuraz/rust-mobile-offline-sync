@@ -1,0 +1,22 @@
+[package]
+name = "backend"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "backend"
+path = "src/lib.rs"
+
+# The real event server.
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+
+[dependencies]
+async-trait = "0.1.89"
+axum = "0.8.9"
+serde = { workspace = true, features = ["derive"] }
+shared = { path = "../shared" }
+tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "net"] }
+uuid.workspace = true

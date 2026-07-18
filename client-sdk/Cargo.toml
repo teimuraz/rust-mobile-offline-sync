@@ -1,0 +1,25 @@
+[package]
+name = "client-sdk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+# The mobile SDK. Compiles to the iOS .xcframework and the Android library. This is
+# the ONLY mobile-specific crate — all domain/sync logic lives in `shared`.
+[lib]
+name = "client_sdk"
+crate-type = ["lib", "staticlib"]
+
+# In-crate uniffi-bindgen runner used by build_ios.sh.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi_bindgen.rs"
+
+[dependencies]
+shared = { path = "../shared" }
+uniffi = { version = "0.32.0", features = ["cli", "tokio"] }
+# The device's HTTP client to the server — shared Rust, runs on iOS and Android.
+reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
+uuid.workspace = true
+async-trait = "0.1.89"
+tokio = { version = "1.53.0", features = ["rt-multi-thread", "time", "sync"] }
