@@ -126,7 +126,7 @@ fn order_key(d: &EventDescriptor) -> (i64, u64, Uuid) {
 
 So the whole rule is: **the most recent change by the device clock wins**, and everything gets applied in that order. It's not a clever academic algorithm — I deliberately kept it dead simple, predictable, and easy to reason about. The one extra rule I add: **deletion wins over concurrent edits** — and as you saw above, that's not special machinery, it's a single `if self.deleted { return; }`.
 
-Sync itself is then almost boring, which is the goal. The server stamps each event with a monotonic `ServerOffset`. A device remembers the highest offset it has pulled and asks: *"give me everything after this."* It folds the new events into its projections, ships its own un-synced events up, done. In the real app that ask-and-ship is a gRPC round-trip to the backend; in the demo repo it's just an in-process function call — same logic, different transport. No diffing, no merge UI, no magic:
+Sync itself is then almost boring, which is the goal. The server stamps each event with a monotonic `ServerOffset`. A device remembers the highest offset it has pulled and asks: *"give me everything after this."* It folds the new events into its projections, ships its own un-synced events up, done. In the real app that ask-and-ship is a gRPC round-trip to the backend; in the demo repo it's plain HTTP — same logic, different transport. No diffing, no merge UI, no magic:
 
 ```rust
 pub trait EventLog<E, EntId> {
