@@ -5,21 +5,21 @@ it as the page H1, so it must NOT also appear as a `#` heading in the body):
 I built an offline-first sync engine with event sourcing, in Rust shared between mobile and backend
 -->
 
-*A small, honest write-up of a thing I built mostly for fun, that somehow ended up working. Code: [github.com/teimuraz/rust-mobile-offline-sync](https://github.com/teimuraz/rust-mobile-offline-sync)*
+*A small write-up about something I built mostly for fun — and it works. Code: [github.com/teimuraz/rust-mobile-offline-sync](https://github.com/teimuraz/rust-mobile-offline-sync)*
 
-First, the setup — because it explains all the Rust in this post. The app I built this for is [TrainVision](https://trainvision.ai), a mobile-first platform for collecting machine-learning training data out in the real world (where reliable connectivity is often exactly what you don't have). Its **core is written in Rust and shared across iOS and Android** via [UniFFI](https://mozilla.github.io/uniffi-rs/): the models, the sync, the business rules are written *once* in Rust and compiled into a native library both phones call through generated Swift and Kotlin bindings. The **backend is Rust too**, so the same code runs there. Storage is **SQLite on the device** and **Postgres on the backend**. That shared-Rust core is half of what this post is about; event sourcing is the other half — and the two turn out to fit together beautifully for offline sync.
+First, the setup — because it explains all the Rust in this post. The app I built this for is [TrainVision](https://trainvision.ai), a mobile-first platform for collecting machine-learning training data out in the real world (where reliable connectivity is often exactly what you don't have). Its **core is written in Rust and shared across iOS and Android** via [UniFFI](https://mozilla.github.io/uniffi-rs/): the models, the sync, the business rules are written *once* in Rust and compiled into a native library that both platforms call through generated Swift and Kotlin bindings. The **backend is Rust too**, so the same code runs there. Storage is **SQLite on the device** and **Postgres on the backend**. That shared-Rust core is half of what this post is about, event sourcing is the other half — and the two turn out to fit together beautifully for offline sync.
 
 Now the actual problem. I needed an app that works with no internet. Not "degrades gracefully" — genuinely works: you're in a field, a factory, a basement, you capture data all day, and it syncs whenever a connection comes back. Sometimes there's good signal, often it's weak, sometimes there's none at all — the point of offline-*first* is that the app never assumes the network is there. Connectivity is a nice bonus when it shows up, not something the app leans on.
 
-I looked for something existing first — Couchbase (Lite + Sync Gateway), ObjectBox, a few others. I got furthest with Couchbase, but couldn't get it to click. The moment I wanted to control how conflicts resolved or shape sync around my own domain, I felt like I was fighting the framework instead of using it — and I'd be paying for the privilege. *[add your own one-liner about the specific wall you hit]*
+I looked for something existing first — Couchbase (Lite + Sync Gateway), ObjectBox, a few others. I got furthest with Couchbase, but couldn't get it to click. The moment I wanted to control how conflicts resolved or shape sync around my own domain, I felt like I was fighting the framework instead of using it.
 
 I don't recommend "just build your own sync engine" as career advice. But I was curious, it looked fun, and I wanted full control. So I started sketching how I'd do it myself — and it hit me: **event sourcing.**
 
-It wasn't a bolt from the blue. I'd played with event sourcing before, in a completely different context — a classic event-sourced *backend* architecture, nothing to do with offline or mobile. I'd found it a genuinely interesting way to build a system: state as a fold over an append-only log of domain events. So when I started thinking about how two offline devices could ever reconcile, that old idea walked right back in the door wearing a new hat.
+It wasn't a bolt from the blue. I'd played with event sourcing before, in a completely different context — a classic event-sourced *backend* architecture, nothing to do with offline or mobile. I'd found it a genuinely interesting way to build a system: state as a fold over an append-only log of domain events. So when I started thinking about how multiple offline devices could ever reconcile, I remembered it — and realized it fits this problem really well.
 
 ## Why event sourcing makes offline sync easy
 
-The hard part of offline-first isn't storing data locally. It's *merging*. Two devices edit the same thing while both are offline; someone deletes a record another person just updated; the same change syncs twice on a flaky connection. If each device only keeps the **current state**, merging means shipping whole entities back and forth, comparing them field by field, and guessing what changed — and every one of those guesses is a chance to get it wrong. I wanted something stupidly simple instead.
+The hard part of offline-first isn't storing data locally. It's *merging*. Multiple devices edit the same thing while offline; someone deletes a record another person just updated; the same change syncs twice on a flaky connection. If each device only keeps the **current state**, merging means shipping whole entities back and forth, comparing them field by field, and guessing what changed — and every one of those guesses is a chance to get it wrong. I wanted something stupidly simple instead.
 
 Event sourcing flips it. You don't store the item. You store the **events** that produced it:
 
@@ -42,9 +42,9 @@ pub trait EventSourcedEntity: Default {
     type Evt: Event;
     type EntId: EntityId;
 
-    /// The only thing a domain type must define: given the current state and one
-    /// event, produce the next state.
-    fn apply_event(&mut self, event: Self::Evt, modification_info: ModificationInfo);
+    /// How one event changes the entity: given the current state, one event,
+    /// and when it happened, produce the next state.
+    fn apply_event(&mut self, event: Self::Evt, modified_at_ms: i64);
 
     fn uncommitted_events(&mut self) -> &mut Vec<EntityEvent<Self::Evt>>;
     fn id(&self) -> &Self::EntId;
@@ -53,8 +53,8 @@ pub trait EventSourcedEntity: Default {
     fn build_from_history(events: Vec<EventDescriptor<Self::Evt, Self::EntId>>) -> Self {
         let mut entity = Self::default();
         for event in events {
-            let info = event.modification_info();
-            entity.apply_event(event.payload, info);
+            let at = event.replica_time_ms;
+            entity.apply_event(event.payload, at);
         }
         entity
     }
@@ -63,7 +63,7 @@ pub trait EventSourcedEntity: Default {
     /// the UI updates immediately — even fully offline.
     fn new_event(&mut self, event: EntityEvent<Self::Evt>) {
         self.uncommitted_events().push(event.clone());
-        self.apply_event(event.event, event.modification_info);
+        self.apply_event(event.event, event.modified_at_ms);
     }
 }
 ```
@@ -71,11 +71,11 @@ pub trait EventSourcedEntity: Default {
 A domain type implements `apply_event` **once** — "given current me and this event, here's the new me" — and gets local optimistic updates, history rebuild, and sync for free. In the demo repo that domain type is a deliberately boring inventory `Item`, and its `apply_event` is the whole thing:
 
 ```rust
-fn apply_event(&mut self, event: ItemEvent, info: ModificationInfo) {
+fn apply_event(&mut self, event: ItemEvent, modified_at_ms: i64) {
     if self.deleted {
         return; // deletion is terminal — this line is the entire "delete wins" rule
     }
-    self.last_modified_ms = info.replica_time_ms;
+    self.last_modified_ms = modified_at_ms;
     match event {
         ItemEvent::Created { name, quantity } => { self.name = name; self.quantity = quantity; }
         ItemEvent::Renamed { name }           => self.name = name,
@@ -138,7 +138,7 @@ pub trait EventLog<E, EntId> {
 
 ## The part I'm actually proud of: one codebase, three platforms
 
-I write Rust for the backend. The mobile app is iOS (Swift) and Android (Kotlin). And it isn't just the sync plumbing that's shared — the **domain models and their events are shared too.** The `Item` entity, the `ItemEvent` enum that spells out every change that can happen to it, the fold that turns those events into current state, the ordering, the codecs both sides must agree on byte-for-byte — all of it is the **exact same Rust code** running in all three places. I define an entity and its events *once*, and the backend and both phones already agree, down to the byte, on what they are.
+I write Rust for the backend. The mobile app is iOS (Swift) and Android (Kotlin). And it isn't just the sync plumbing that's shared — the **domain models and their events are shared too.** The `Item` entity, the `ItemEvent` enum that spells out every change that can happen to it, the fold that turns those events into current state, the ordering, the codecs both sides must agree on byte-for-byte — all of it is the **exact same Rust code** running in all three places. I define an entity and its events *once*, and the backend, iOS, and Android already agree, down to the byte, on what they are.
 
 The device and the server implement the *same* `EventLog` trait. On the backend it's backed by **Postgres**; on the phone by **SQLite**. Same interface, same folding logic, same conflict rules — because it is *literally the same functions* on top of two different storage backends. On mobile the crate is compiled to a native library and exposed to Swift/Kotlin through UniFFI, so iOS and Android share it too.
 
@@ -174,7 +174,7 @@ If it's useful to anyone, I pulled the core idea into a tiny, generic demo — a
 
 **→ [github.com/teimuraz/rust-mobile-offline-sync](https://github.com/teimuraz/rust-mobile-offline-sync)**
 
-It's deliberately small. The point isn't the app; it's the shape: one Rust event model, folded on the server and on the phone, synced by a plain offset cursor. If you're staring down offline-first and the existing tools feel like too much, maybe event sourcing is your cheat code too.
+It's deliberately small. The point isn't the app, it's the shape: one Rust event model, folded on the server and on the phone, synced by a plain offset cursor. If you need offline-first and the existing tools feel like too much, maybe event sourcing is a good fit for you too.
 
 This is the engine behind [TrainVision](https://trainvision.ai) — if you're collecting training data in the field and want it to just work offline, that's what it's for.
 

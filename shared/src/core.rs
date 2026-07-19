@@ -82,7 +82,7 @@ pub trait EventSourcedEntity: Default {
 
     fn uncommitted_events(&mut self) -> &mut Vec<EntityEvent<Self::Evt>>;
 
-    /// The only thing an entity must define: given the current state, one event,
+    /// How one event changes the entity: given the current state, one event,
     /// and when it happened, produce the next state.
     fn apply_event(&mut self, event: Self::Evt, modified_at_ms: i64);
 
